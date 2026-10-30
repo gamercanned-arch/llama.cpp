@@ -2126,6 +2126,12 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
     __m128 acc_m = _mm_setzero_ps();
 
    for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*)(x + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(x + i + 2)->qs + 64, _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2)->qs + 64, _MM_HINT_T0);
+        }
 
         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
         const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
@@ -2161,16 +2167,20 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
             const __m256i q4l = _mm256_and_si256(q4bits, m4);
             const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
 
-            const __m256i q8l = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-            __m256i p16l = _mm256_maddubs_epi16(q4l, q8l);
-            p16l = _mm256_madd_epi16(scale_l, p16l);
+            // Issue paired loads exploiting Zen 3's two 256-bit load AGUs
+            const __m256i q8l = _mm256_loadu_si256((const __m256i*)q8);
+            const __m256i q8h = _mm256_loadu_si256((const __m256i*)(q8 + 32));
+            q8 += 64;
 
-            const __m256i q8h = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-            __m256i p16h = _mm256_maddubs_epi16(q4h, q8h);
-            p16h = _mm256_madd_epi16(scale_h, p16h);
-            const __m256i sumj = _mm256_add_epi32(p16l, p16h);
+            // Decouple dependency chains: issue maddubs across Port 0
+            const __m256i dot_l = _mm256_maddubs_epi16(q4l, q8l);
+            const __m256i dot_h = _mm256_maddubs_epi16(q4h, q8h);
 
-            sumi = _mm256_add_epi32(sumi, sumj);
+            // While dot_h finishes, dot_l immediately dispatches to madd_epi16 on Port 1
+            const __m256i p16l = _mm256_madd_epi16(scale_l, dot_l);
+            const __m256i p16h = _mm256_madd_epi16(scale_h, dot_h);
+
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));
         }
 
         __m256 vd = _mm256_set1_ps(d);
@@ -2743,6 +2753,11 @@ void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*)(x + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2)->qs + 64, _MM_HINT_T0);
+        }
         const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
         const uint16_t * GGML_RESTRICT q2 = x[i].qs;
         const int8_t   * GGML_RESTRICT q8 = y[i].qs;
@@ -2784,6 +2799,11 @@ void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*)(x + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2)->qs + 64, _MM_HINT_T0);
+        }
         const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
         const uint16_t * GGML_RESTRICT q2 = x[i].qs;
         const int8_t   * GGML_RESTRICT q8 = y[i].qs;
@@ -2889,6 +2909,11 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*)(x + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2)->qs + 64, _MM_HINT_T0);
+        }
         const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
         const uint16_t * GGML_RESTRICT q2 = x[i].qs;
         const int8_t   * GGML_RESTRICT q8 = y[i].qs;
@@ -3010,6 +3035,11 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*)(x + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2)->qs + 64, _MM_HINT_T0);
+        }
         const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
         const uint16_t * GGML_RESTRICT q2 = x[i].qs;
         const int8_t   * GGML_RESTRICT q8 = y[i].qs;
@@ -3169,6 +3199,11 @@ void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*)(x + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2)->qs + 64, _MM_HINT_T0);
+        }
         const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
         const uint8_t * GGML_RESTRICT qs = x[i].qs;
         const uint8_t * GGML_RESTRICT qh = x[i].qh;
@@ -3242,6 +3277,11 @@ void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*)(x + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2)->qs + 64, _MM_HINT_T0);
+        }
         const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
         const uint8_t * GGML_RESTRICT qs = x[i].qs;
         const uint8_t * GGML_RESTRICT qh = x[i].qh;
@@ -3342,6 +3382,11 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*)(x + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2)->qs + 64, _MM_HINT_T0);
+        }
         const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
         const uint8_t * GGML_RESTRICT q3 = x[i].qs;
         const uint8_t * GGML_RESTRICT gas = x[i].qs + QK_K/4;
@@ -3387,6 +3432,11 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*)(x + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2)->qs + 64, _MM_HINT_T0);
+        }
         const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
         const uint8_t * GGML_RESTRICT q3 = x[i].qs;
         const uint8_t * GGML_RESTRICT gas = x[i].qs + QK_K/4;
@@ -3483,6 +3533,11 @@ void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*)(x + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2)->qs + 64, _MM_HINT_T0);
+        }
         const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
         const uint8_t * GGML_RESTRICT qs = x[i].qs;
         const uint8_t * GGML_RESTRICT qh = x[i].qh;
@@ -3568,6 +3623,11 @@ void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*)(x + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*)(y + i + 2)->qs + 64, _MM_HINT_T0);
+        }
         const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
         const uint8_t * GGML_RESTRICT qs = x[i].qs;
         const uint8_t * GGML_RESTRICT qh = x[i].qh;

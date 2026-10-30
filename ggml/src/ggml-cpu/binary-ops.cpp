@@ -92,6 +92,23 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
 
         if (is_src1_contiguous_rows) {
             // src1 is broadcastable across src0 and dst in i1, i2, i3
+            if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> && std::is_same_v<dst_t, float>) {
+                if (ne10 == 1) {
+                    const float val = *src1_ptr;
+                    if (op == op_mul) {
+                        for (int64_t i = 0; i < ne00; ++i) {
+                            dst_ptr[i] = src0_ptr[i] * val;
+                        }
+                        continue;
+                    } else if (op == op_add) {
+                        for (int64_t i = 0; i < ne00; ++i) {
+                            dst_ptr[i] = src0_ptr[i] + val;
+                        }
+                        continue;
+                    }
+                }
+            }
+
             const int64_t nr0 = ne00 / ne10;
 
             for (int64_t r = 0; r < nr0; ++r) {

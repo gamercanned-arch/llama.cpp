@@ -28,6 +28,8 @@
 // name, so calling it is an implicit declaration and the program fails to build.
 // Route it to the qcom builtin.
 #define sub_group_shuffle_xor(val, mask) qcom_sub_group_shuffle_xor((val), (mask), CLK_SUB_GROUP_SHUFFLE_WIDTH_WAVE_SIZE_QCOM, 0.0f)
+#else
+#define sub_group_shuffle_xor(val, mask) (0.0f)
 #endif
 
 // Assumes row size (ne00) is a multiple of 4
@@ -184,8 +186,9 @@ kernel void kernel_mul_mat_f16_f32_l4_dr(
 // Kernels for decoding, Adreno only for now
 #define MUL_MAT_F16_F32_L4_DR_LS_R2_MAX 8
 
-#ifdef ADRENO_GPU
+#if defined(ADRENO_GPU) && defined(cl_qcom_subgroup_shuffle)
 #pragma OPENCL EXTENSION cl_qcom_subgroup_shuffle : enable
+#undef sub_group_shuffle_xor
 #define sub_group_shuffle_xor(val, mask) qcom_sub_group_shuffle_xor((val), (mask), CLK_SUB_GROUP_SHUFFLE_WIDTH_WAVE_SIZE_QCOM, 0.0f)
 
 REQD_SUBGROUP_SIZE_64

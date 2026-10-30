@@ -82,10 +82,24 @@ static void ggml_opencl_fa_apply_env_overrides() {
 // Copy the default table into the mutable runtime buffer and apply any
 // GGML_OPENCL_FA_TUNE overrides. A per-generation table can be added here
 // once it has been tuned on hardware.
-static void ggml_cl_init_fa_dims_table() {
+static void ggml_cl_init_fa_dims_table(const char * dev_name = nullptr) {
     const size_t count = sizeof(g_fa_dims_adreno_default) / sizeof(g_fa_dims_adreno_default[0]);
+    bool is_amd = dev_name && (strstr(dev_name, "AMD") || strstr(dev_name, "gfx") || strstr(dev_name, "Radeon"));
     for (size_t i = 0; i < count; ++i) {
         g_fa_dims_runtime[i] = g_fa_dims_adreno_default[i];
+        if (is_amd) {
+            if (g_fa_dims_runtime[i].bn > 16) {
+                g_fa_dims_runtime[i].bn = 16;
+            }
+            if (g_fa_dims_runtime[i].dk >= 256) {
+                if (g_fa_dims_runtime[i].n_split > 8) {
+                    g_fa_dims_runtime[i].n_split = 8;
+                }
+                if (g_fa_dims_runtime[i].dk >= 512 && g_fa_dims_runtime[i].bn > 8) {
+                    g_fa_dims_runtime[i].bn = 8;
+                }
+            }
+        }
     }
     g_opencl_fa_dims = { g_fa_dims_runtime, count };
     ggml_opencl_fa_apply_env_overrides();

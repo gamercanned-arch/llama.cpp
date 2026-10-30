@@ -1,4 +1,13 @@
-# llama.cpp
+# llama.cpp — AMD Ryzen APU Optimized Edition
+
+> [!NOTE]
+> ### 🚀 Specialized AMD Ryzen APU Performance Fork
+> **Maintained by [@gamercanned-arch](https://github.com/gamercanned-arch)**
+>
+> This is a specialized, hardware-tuned fork of `llama.cpp` engineered specifically for **AMD Ryzen APUs** (Zen 3 / Zen 4 / Zen 5 CPU architectures paired with Radeon Vega / RDNA integrated GPUs):
+> - **Unified Memory Dynamic Offloading (Prefill-GPU + Decode-CPU)**: Takes advantage of APU Unified Memory Architecture (UMA) via zero-copy host buffers (`CL_MEM_USE_HOST_PTR`). Batched prompt processing (Prefill) automatically executes on the massive parallel compute units of the iGPU, while single-token generation (Decode) seamlessly routes to Zen CPU cores with large L3 cache and zero driver dispatch overhead—eliminating weight duplication and PCIe copy penalties.
+> - **Zen 3 Dual-Port AVX2 Microkernel Tuning**: Interleaved 2-way unrolling (`_mm256_maddubs_epi16` and `_mm256_madd_epi16`), SIMD table gathers, and software prefetching for `Q4_K` and `IQ3_XXS` quantization to saturate DRAM bus bandwidth without execution port serialization.
+> - **Vega 8 GCN5 OpenCL Kernel Tuning**: 64-wide wavefront alignment, 4x barrier reduction, and 12 KB LDS tile caching fitting within the 32 KB LDS hardware ceiling.
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 

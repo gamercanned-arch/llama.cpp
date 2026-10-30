@@ -9,7 +9,7 @@
 
 #define OPWM 64
 #define OPWN 64
-#define CPWK 8
+#define CPWK 16
 #define OPTM 4
 #define OPTN 8
 
@@ -31,6 +31,7 @@ __kernel void mul_mat_f16_f32(
     const int lidm = get_local_id(0);
     const int lidn = get_local_id(1);
     const int lid = lidn * WG_M + lidm;
+    const int num_threads = WG_M * WG_N;
 
     const int offsetM = get_group_id(0) * OPWM;
     const int offsetN = get_group_id(1) * OPWN;
@@ -48,45 +49,49 @@ __kernel void mul_mat_f16_f32(
 
     const int numTiles = (K + CPWK - 1) / CPWK;
 
-    const int load_row_a = lid % OPWM;
-    const int load_vec_k_a = lid / OPWM;
-    const int global_row_a = offsetM + load_row_a;
-
-    const int load_row_b = lid % OPWN;
-    const int load_vec_k_b = lid / OPWN;
-    const int global_row_b = offsetN + load_row_b;
-
     for (int t = 0; t < numTiles; t++) {
         const int k_start = t * CPWK;
-        const int k_vec_start_a = k_start + load_vec_k_a * 4;
-        const int k_vec_start_b = k_start + load_vec_k_b * 4;
 
-        if (global_row_a < M && k_vec_start_a < K) {
-            if (k_vec_start_a + 3 < K) {
-                Alocal[load_row_a][load_vec_k_a] = vload4(0, A + global_row_a * K + k_vec_start_a);
+        for (int l = lid; l < OPWM * VEC_K; l += num_threads) {
+            const int l_row_a = l % OPWM;
+            const int l_vec_a = l / OPWM;
+            const int g_row_a = offsetM + l_row_a;
+            const int k_vec_a = k_start + l_vec_a * 4;
+
+            if (g_row_a < M && k_vec_a < K) {
+                if (k_vec_a + 3 < K) {
+                    Alocal[l_row_a][l_vec_a] = vload4(0, A + g_row_a * K + k_vec_a);
+                } else {
+                    half4 tempA = (half4)(0.0h);
+                    if (k_vec_a < K) tempA.s0 = A[g_row_a * K + k_vec_a];
+                    if (k_vec_a + 1 < K) tempA.s1 = A[g_row_a * K + k_vec_a + 1];
+                    if (k_vec_a + 2 < K) tempA.s2 = A[g_row_a * K + k_vec_a + 2];
+                    Alocal[l_row_a][l_vec_a] = tempA;
+                }
             } else {
-                half4 tempA = (half4)(0.0h);
-                if (k_vec_start_a < K) tempA.s0 = A[global_row_a * K + k_vec_start_a];
-                if (k_vec_start_a + 1 < K) tempA.s1 = A[global_row_a * K + k_vec_start_a + 1];
-                if (k_vec_start_a + 2 < K) tempA.s2 = A[global_row_a * K + k_vec_start_a + 2];
-                Alocal[load_row_a][load_vec_k_a] = tempA;
+                Alocal[l_row_a][l_vec_a] = (half4)(0.0h);
             }
-        } else {
-            Alocal[load_row_a][load_vec_k_a] = (half4)(0.0h);
         }
 
-        if (global_row_b < N && k_vec_start_b < K) {
-            if (k_vec_start_b + 3 < K) {
-                Blocal[load_row_b][load_vec_k_b] = vload4(0, B + global_row_b * K + k_vec_start_b);
+        for (int l = lid; l < OPWN * VEC_K; l += num_threads) {
+            const int l_row_b = l % OPWN;
+            const int l_vec_b = l / OPWN;
+            const int g_row_b = offsetN + l_row_b;
+            const int k_vec_b = k_start + l_vec_b * 4;
+
+            if (g_row_b < N && k_vec_b < K) {
+                if (k_vec_b + 3 < K) {
+                    Blocal[l_row_b][l_vec_b] = vload4(0, B + g_row_b * K + k_vec_b);
+                } else {
+                    float4 tempB = (float4)(0.0f);
+                    if (k_vec_b < K) tempB.s0 = B[g_row_b * K + k_vec_b];
+                    if (k_vec_b + 1 < K) tempB.s1 = B[g_row_b * K + k_vec_b + 1];
+                    if (k_vec_b + 2 < K) tempB.s2 = B[g_row_b * K + k_vec_b + 2];
+                    Blocal[l_row_b][l_vec_b] = tempB;
+                }
             } else {
-                float4 tempB = (float4)(0.0f);
-                if (k_vec_start_b < K) tempB.s0 = B[global_row_b * K + k_vec_start_b];
-                if (k_vec_start_b + 1 < K) tempB.s1 = B[global_row_b * K + k_vec_start_b + 1];
-                if (k_vec_start_b + 2 < K) tempB.s2 = B[global_row_b * K + k_vec_start_b + 2];
-                Blocal[load_row_b][load_vec_k_b] = tempB;
+                Blocal[l_row_b][l_vec_b] = (float4)(0.0f);
             }
-        } else {
-            Blocal[load_row_b][load_vec_k_b] = (float4)(0.0f);
         }
 
         barrier(CLK_LOCAL_MEM_FENCE);

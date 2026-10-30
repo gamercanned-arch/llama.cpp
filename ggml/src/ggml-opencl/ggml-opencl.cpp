@@ -1269,8 +1269,22 @@ struct ggml_backend_opencl_context {
             flush_profiling_batch();
         }
 #else
-        GGML_UNUSED(tensor);
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+        char k_name[128] = {0};
+        clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(k_name), k_name, NULL);
+        size_t max_wg = 0;
+        cl_ulong lmem_used = 0;
+        clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &max_wg, NULL);
+        clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(cl_ulong), &lmem_used, NULL);
+        cl_int cl_res = clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL);
+        if (cl_res != CL_SUCCESS) {
+            GGML_LOG_ERROR("ggml_opencl: clEnqueueNDRangeKernel %s failed (%d) max_wg=%zu lmem=%llu dim=%u G=[%zu,%zu,%zu] L=[%zu,%zu,%zu]\n",
+                k_name, cl_res, max_wg, lmem_used, work_dim,
+                global_work_size[0], work_dim > 1 ? global_work_size[1] : 1, work_dim > 2 ? global_work_size[2] : 1,
+                local_work_size ? local_work_size[0] : 0,
+                (local_work_size && work_dim > 1) ? local_work_size[1] : 0,
+                (local_work_size && work_dim > 2) ? local_work_size[2] : 0);
+            GGML_ASSERT(0);
+        }
 #endif
     }
 
@@ -1846,6 +1860,12 @@ static std::string ggml_opencl_make_compile_opts(const ggml_backend_opencl_conte
 
     if (backend_ctx->adreno_use_large_buffer) {
         compile_opts += " -qcom-enable-large-buffer ";
+    }
+
+    if (strstr(backend_ctx->device_name.c_str(), "AMD") ||
+        strstr(backend_ctx->device_name.c_str(), "gfx") ||
+        strstr(backend_ctx->device_name.c_str(), "Radeon")) {
+        compile_opts += " -DADRENO_GPU=1 -DREQD_SUBGROUP_SIZE_16= -DREQD_SUBGROUP_SIZE_32= -DREQD_SUBGROUP_SIZE_64= -DREQD_SUBGROUP_SIZE_128=";
     }
 
     return compile_opts;
@@ -3131,7 +3151,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4   = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4_dr = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_dr", &err), err));
-        if (backend_ctx->gpu_family == ADRENO) {
+        if (backend_ctx->gpu_family == ADRENO && backend_ctx->has_qcom_subgroup_shuffle) {
             CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4_dr_ls = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_dr_ls", &err), err));
             CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4_dr_lq = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_dr_lq", &err), err));
         }
@@ -8107,6 +8127,10 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
         }
     } else if (strstr(dev_ctx->device_name.c_str(), "Intel")) {
         dev_ctx->gpu_family = GPU_FAMILY::INTEL;
+    } else if (strstr(dev_ctx->device_name.c_str(), "AMD") ||
+               strstr(dev_ctx->device_name.c_str(), "gfx") ||
+               strstr(dev_ctx->device_name.c_str(), "Radeon")) {
+        dev_ctx->gpu_family = GPU_FAMILY::ADRENO;
     } else {
         GGML_LOG_WARN("ggml_opencl: unsupported GPU '%s'.\n", dev_ctx->device_name.c_str());
         dev_ctx->gpu_family = GPU_FAMILY::UNKNOWN;
@@ -8190,7 +8214,7 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     backend_ctx->gpu_family = dev_ctx->gpu_family;
     backend_ctx->adreno_gen = dev_ctx->adreno_gen;
     if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
-        ggml_cl_init_fa_dims_table();
+        ggml_cl_init_fa_dims_table(dev_ctx->device_name.c_str());
 
         // Use wave size of 64 for all Adreno GPUs.
         backend_ctx->adreno_wave_size = 64;
@@ -8402,6 +8426,11 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     }
     if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ADD")) {
         backend_ctx->fuse_rms_add = atoi(env) != 0;
+    }
+    if (strstr(backend_ctx->device_name.c_str(), "AMD") ||
+        strstr(backend_ctx->device_name.c_str(), "gfx") ||
+        strstr(backend_ctx->device_name.c_str(), "Radeon")) {
+        backend_ctx->f16_mrow = false;
     }
     if (const char * env = getenv("GGML_OPENCL_F16_MROW")) {
         backend_ctx->f16_mrow = atoi(env) != 0;
@@ -11175,8 +11204,10 @@ struct ggml_backend_opencl_buffer_context {
     // each tensor is allocated a separate buffer. When flattening is enabled
     // with small allocation, each tensor is backed by two cl_mem objects (for
     // quants and scales) packed into a backend_opencl_buffer.
-    ggml_backend_opencl_buffer_context(cl_mem buf)
-        : name("OpenCL") {
+    void * host_ptr = nullptr;
+
+    ggml_backend_opencl_buffer_context(cl_mem buf, void * hptr = nullptr)
+        : host_ptr(hptr), name("OpenCL") {
         buffer.push_back(buf);
     }
 
@@ -11662,6 +11693,7 @@ struct ggml_backend_opencl_buffer_context {
 
         q8_0_soa_tensors.clear();
         q4_0_soa_tensors.clear();
+        soa_tensors.clear();
     }
 
     // Pools for extras. Available extras are in `temp_tensor_extras`. Extras
@@ -11716,6 +11748,7 @@ struct ggml_backend_opencl_buffer_context {
     // through set_tensor, so they stay AoS and aren't in this set.
     // In Q4_0's case, in addition to normal weights, we have MoE weights.
     std::unordered_set<const ggml_tensor *> q4_0_soa_tensors;
+    std::unordered_set<const ggml_tensor *> soa_tensors;
 
     // The buffer_context is initially created by ggml_backend_buft_alloc_buffer
     // before any tensor is initialized (at the beginning of alloc_tensor_range).
@@ -11739,6 +11772,10 @@ static void ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer)
 }
 
 static void * ggml_backend_opencl_buffer_get_base(ggml_backend_buffer_t buffer) {
+    ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+    if (ctx && ctx->host_ptr != nullptr) {
+        return ctx->host_ptr;
+    }
     ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
     return (void *) (uintptr_t) dev_ctx->backend_ctx->alignment;
 }
@@ -11882,6 +11919,33 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     cl_command_queue queue = backend_ctx->queue;
 
 #ifdef GGML_OPENCL_SOA_Q
+    ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+    if (ctx != nullptr) {
+        const ggml_tensor * key = tensor->view_src != nullptr ? tensor->view_src : tensor;
+        if (ctx->soa_tensors.count(key) > 0) {
+            return;
+        }
+    }
+
+    if (tensor->view_src != nullptr || !ggml_is_contiguous(tensor)) {
+        ggml_tensor_extra_cl * extra_aos = (ggml_tensor_extra_cl *) tensor->extra;
+        CL_CHECK(clEnqueueWriteBuffer(
+            queue, extra_aos->data_device, CL_TRUE,
+            extra_aos->offset + tensor->view_offs + offset,
+            size, data, 0, NULL, NULL));
+        return;
+    }
+
+    struct SoaAutoTracker {
+        ggml_backend_opencl_buffer_context * ctx;
+        const ggml_tensor * tensor;
+        ~SoaAutoTracker() {
+            if (ctx && ggml_is_quantized(tensor->type)) {
+                ctx->soa_tensors.insert(tensor);
+            }
+        }
+    } soa_tracker{ctx, tensor};
+
     if (tensor->type == GGML_TYPE_Q2_K) {
         GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor));
         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
@@ -14034,6 +14098,15 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
     sync_with_other_backends(backend_ctx);
 
 #ifdef GGML_OPENCL_SOA_Q
+    if (tensor->view_src != nullptr || !ggml_is_contiguous(tensor)) {
+        ggml_tensor_extra_cl * extra_aos = (ggml_tensor_extra_cl *) tensor->extra;
+        CL_CHECK(clEnqueueReadBuffer(
+            queue, extra_aos->data_device, CL_TRUE,
+            extra_aos->offset + tensor->view_offs + offset,
+            size, data, 0, NULL, NULL));
+        return;
+    }
+
     if (tensor->type == GGML_TYPE_Q2_K) {
         ggml_tensor_extra_cl_q2_K * extra = (ggml_tensor_extra_cl_q2_K *)tensor->extra;
 
@@ -15751,11 +15824,42 @@ static ggml_backend_buffer_type_t ggml_backend_opencl_device_get_buffer_type(ggm
 }
 
 static ggml_backend_buffer_t ggml_backend_opencl_device_buffer_from_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
-    GGML_UNUSED(dev);
-    GGML_UNUSED(ptr);
-    GGML_UNUSED(size);
     GGML_UNUSED(max_tensor_size);
-    return nullptr;
+    auto * dev_ctx = static_cast<ggml_backend_opencl_device_context *>(dev->context);
+    ggml_backend_opencl_context * backend_ctx = dev_ctx->backend_ctx;
+
+    cl_int err = CL_SUCCESS;
+    cl_mem mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, size, ptr, &err);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_WARN("%s: failed to create zero-copy buffer from host ptr (size=%.2f MiB, err=%d)\n",
+                      __func__, size / 1024.0 / 1024.0, err);
+        return nullptr;
+    }
+
+    auto * ctx = new ggml_backend_opencl_buffer_context(mem, ptr);
+    return ggml_backend_buffer_init(ggml_backend_dev_buffer_type(dev), ggml_backend_opencl_buffer_interface, ctx, size);
+}
+
+static int64_t ggml_opencl_get_op_batch_size(const struct ggml_tensor * op) {
+    switch (op->op) {
+        case GGML_OP_MUL_MAT:
+            return op->ne[1];
+        case GGML_OP_MUL_MAT_ID:
+            return op->ne[2];
+        default:
+            return ggml_nrows(op);
+    }
+}
+
+static bool ggml_backend_opencl_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    static int min_batch = -1;
+    if (min_batch == -1) {
+        const char * env = getenv("GGML_OPENCL_OP_OFFLOAD_MIN_BATCH");
+        min_batch = env ? atoi(env) : 32;
+    }
+    return (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) &&
+           ggml_opencl_get_op_batch_size(op) >= min_batch;
+    GGML_UNUSED(dev);
 }
 
 static bool ggml_backend_opencl_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
@@ -15790,7 +15894,7 @@ struct ggml_backend_device_i ggml_backend_opencl_device_i = {
     /* .buffer_from_host_ptr = */ ggml_backend_opencl_device_buffer_from_ptr,
     /* .supports_op          = */ ggml_backend_opencl_device_supports_op,
     /* .supports_buft        = */ ggml_backend_opencl_device_supports_buft,
-    /* .offload_op           = */ NULL,
+    /* .offload_op           = */ ggml_backend_opencl_device_offload_op,
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
