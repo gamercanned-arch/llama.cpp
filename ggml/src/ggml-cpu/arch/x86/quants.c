@@ -501,10 +501,126 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 #endif
 }
 
+#if defined(__AVX2__)
+void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    block_q8_K * GGML_RESTRICT y = (block_q8_K *) vy;
+
+    const __m256 signBit = _mm256_set1_ps(-0.0f);
+    const __m256i ones_epi8 = _mm256_set1_epi8(1);
+    const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+
+    for (int64_t i = 0; i < nb; i++) {
+        // --- Pass 1: Vectorized absolute maximum and signed extremum ---
+        __m256 v0 = _mm256_loadu_ps(x +  0);
+        __m256 v1 = _mm256_loadu_ps(x +  8);
+        __m256 v2 = _mm256_loadu_ps(x + 16);
+        __m256 v3 = _mm256_loadu_ps(x + 24);
+
+        __m256 max_val = _mm256_max_ps(_mm256_max_ps(v0, v1), _mm256_max_ps(v2, v3));
+        __m256 min_val = _mm256_min_ps(_mm256_min_ps(v0, v1), _mm256_min_ps(v2, v3));
+        __m256 max_abs = _mm256_max_ps(
+            _mm256_max_ps(_mm256_andnot_ps(signBit, v0), _mm256_andnot_ps(signBit, v1)),
+            _mm256_max_ps(_mm256_andnot_ps(signBit, v2), _mm256_andnot_ps(signBit, v3))
+        );
+
+        for (int j = 32; j < QK_K; j += 32) {
+            __m256 w0 = _mm256_loadu_ps(x + j +  0);
+            __m256 w1 = _mm256_loadu_ps(x + j +  8);
+            __m256 w2 = _mm256_loadu_ps(x + j + 16);
+            __m256 w3 = _mm256_loadu_ps(x + j + 24);
+
+            max_val = _mm256_max_ps(max_val, _mm256_max_ps(_mm256_max_ps(w0, w1), _mm256_max_ps(w2, w3)));
+            min_val = _mm256_min_ps(min_val, _mm256_min_ps(_mm256_min_ps(w0, w1), _mm256_min_ps(w2, w3)));
+
+            max_abs = _mm256_max_ps(max_abs, _mm256_andnot_ps(signBit, w0));
+            max_abs = _mm256_max_ps(max_abs, _mm256_andnot_ps(signBit, w1));
+            max_abs = _mm256_max_ps(max_abs, _mm256_andnot_ps(signBit, w2));
+            max_abs = _mm256_max_ps(max_abs, _mm256_andnot_ps(signBit, w3));
+        }
+
+        // Horizontal reduction for amax
+        __m128 a4 = _mm_max_ps(_mm256_extractf128_ps(max_abs, 1), _mm256_castps256_ps128(max_abs));
+        a4 = _mm_max_ps(a4, _mm_movehl_ps(a4, a4));
+        a4 = _mm_max_ss(a4, _mm_movehdup_ps(a4));
+        const float amax = _mm_cvtss_f32(a4);
+
+        if (amax == 0.0f) {
+            y[i].d = 0.0f;
+            memset(y[i].qs, 0, QK_K);
+            memset(y[i].bsums, 0, sizeof(y[i].bsums));
+            x += QK_K;
+            continue;
+        }
+
+        // Horizontal reductions for signed max/min to match reference sign handling
+        __m128 mx4 = _mm_max_ps(_mm256_extractf128_ps(max_val, 1), _mm256_castps256_ps128(max_val));
+        mx4 = _mm_max_ps(mx4, _mm_movehl_ps(mx4, mx4));
+        mx4 = _mm_max_ss(mx4, _mm_movehdup_ps(mx4));
+        const float smax = _mm_cvtss_f32(mx4);
+
+        __m128 mn4 = _mm_min_ps(_mm256_extractf128_ps(min_val, 1), _mm256_castps256_ps128(min_val));
+        mn4 = _mm_min_ps(mn4, _mm_movehl_ps(mn4, mn4));
+        mn4 = _mm_min_ss(mn4, _mm_movehdup_ps(mn4));
+        const float smin = _mm_cvtss_f32(mn4);
+
+        float max_signed = (fabsf(smin) > smax) ? smin : smax;
+        if (fabsf(smin) == smax && smax > 0.0f) {
+            for (int j = 0; j < QK_K; ++j) {
+                if (x[j] == smin) { max_signed = smin; break; }
+                if (x[j] == smax) { max_signed = smax; break; }
+            }
+        }
+
+        const float iscale = -127.0f / max_signed;
+        y[i].d = 1.0f / iscale;
+        const __m256 v_iscale = _mm256_set1_ps(iscale);
+
+        // --- Pass 2: Quantization, Packing & Block Sums ---
+        for (int j = 0; j < QK_K; j += 32) {
+            __m256 u0 = _mm256_mul_ps(_mm256_loadu_ps(x + j +  0), v_iscale);
+            __m256 u1 = _mm256_mul_ps(_mm256_loadu_ps(x + j +  8), v_iscale);
+            __m256 u2 = _mm256_mul_ps(_mm256_loadu_ps(x + j + 16), v_iscale);
+            __m256 u3 = _mm256_mul_ps(_mm256_loadu_ps(x + j + 24), v_iscale);
+
+            u0 = _mm256_round_ps(u0, _MM_ROUND_NEAREST | _MM_FROUND_NO_EXC);
+            u1 = _mm256_round_ps(u1, _MM_ROUND_NEAREST | _MM_FROUND_NO_EXC);
+            u2 = _mm256_round_ps(u2, _MM_ROUND_NEAREST | _MM_FROUND_NO_EXC);
+            u3 = _mm256_round_ps(u3, _MM_ROUND_NEAREST | _MM_FROUND_NO_EXC);
+
+            __m256i i0 = _mm256_cvtps_epi32(u0);
+            __m256i i1 = _mm256_cvtps_epi32(u1);
+            __m256i i2 = _mm256_cvtps_epi32(u2);
+            __m256i i3 = _mm256_cvtps_epi32(u3);
+
+            __m256i p01 = _mm256_packs_epi32(i0, i1);
+            __m256i p23 = _mm256_packs_epi32(i2, i3);
+            __m256i q8  = _mm256_packs_epi16(p01, p23);
+            __m256i qs_ordered = _mm256_permutevar8x32_epi32(q8, perm);
+
+            _mm256_storeu_si256((__m256i *)(y[i].qs + j), qs_ordered);
+
+            // Block sums for 2 groups of 16 bytes:
+            __m256i psum = _mm256_maddubs_epi16(ones_epi8, qs_ordered);
+            __m256i hsum1 = _mm256_hadd_epi16(psum, psum);
+            __m256i hsum2 = _mm256_hadd_epi16(hsum1, hsum1);
+            __m256i hsum3 = _mm256_hadd_epi16(hsum2, hsum2);
+
+            __m128i lo = _mm256_castsi256_si128(hsum3);
+            __m128i hi = _mm256_extracti128_si256(hsum3, 1);
+            y[i].bsums[j/16 + 0] = (int16_t)_mm_extract_epi16(lo, 0);
+            y[i].bsums[j/16 + 1] = (int16_t)_mm_extract_epi16(hi, 0);
+        }
+        x += QK_K;
+    }
+}
+#else
 // placeholder implementation for Apple targets
 void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q8_K_ref(x, y, k);
 }
+#endif
 
 //===================================== Dot products =================================
 

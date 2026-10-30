@@ -12,6 +12,10 @@
 #include <cfloat>
 #include <cmath>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 // ggml_compute_forward_dup
 
 static void ggml_compute_forward_dup_same_cont(
@@ -4113,10 +4117,44 @@ static void ggml_compute_forward_rms_norm_f32(
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
                 ggml_float sum = 0.0;
+#if defined(__AVX2__)
+                int64_t i00 = 0;
+                __m256 acc0 = _mm256_setzero_ps();
+                __m256 acc1 = _mm256_setzero_ps();
+                __m256 acc2 = _mm256_setzero_ps();
+                __m256 acc3 = _mm256_setzero_ps();
+
+                for (; i00 + 31 < ne00; i00 += 32) {
+                    __m256 v0 = _mm256_loadu_ps(x + i00 +  0);
+                    __m256 v1 = _mm256_loadu_ps(x + i00 +  8);
+                    __m256 v2 = _mm256_loadu_ps(x + i00 + 16);
+                    __m256 v3 = _mm256_loadu_ps(x + i00 + 24);
+                    acc0 = _mm256_fmadd_ps(v0, v0, acc0);
+                    acc1 = _mm256_fmadd_ps(v1, v1, acc1);
+                    acc2 = _mm256_fmadd_ps(v2, v2, acc2);
+                    acc3 = _mm256_fmadd_ps(v3, v3, acc3);
+                }
+                acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+                for (; i00 + 7 < ne00; i00 += 8) {
+                    __m256 v = _mm256_loadu_ps(x + i00);
+                    acc0 = _mm256_fmadd_ps(v, v, acc0);
+                }
+                __m128 lo = _mm256_castps256_ps128(acc0);
+                __m128 hi = _mm256_extractf128_ps(acc0, 1);
+                __m128 sum4 = _mm_add_ps(lo, hi);
+                sum4 = _mm_hadd_ps(sum4, sum4);
+                sum4 = _mm_hadd_ps(sum4, sum4);
+                sum = (ggml_float)_mm_cvtss_f32(sum4);
+
+                for (; i00 < ne00; i00++) {
+                    sum += (ggml_float)(x[i00] * x[i00]);
+                }
+#else
                 // worth switching to explicit SIMD?
                 for (int64_t i00 = 0; i00 < ne00; i00++) {
                     sum += (ggml_float)(x[i00] * x[i00]);
                 }
+#endif
 
                 const float mean  = sum/ne00;
                 const float scale = 1.0f/sqrtf(mean + eps);
@@ -4132,12 +4170,38 @@ static void ggml_compute_forward_rms_norm_f32(
                     const int64_t i13 = i03 % ne13;
                     const float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
 
+#if defined(__AVX2__)
+                    const __m256 vscale = _mm256_set1_ps(scale);
+                    int64_t i00 = 0;
+                    for (; i00 + 7 < ne00; i00 += 8) {
+                        __m256 vx = _mm256_loadu_ps(x + i00);
+                        __m256 vw = _mm256_loadu_ps(w + i00);
+                        __m256 vy = _mm256_mul_ps(_mm256_mul_ps(vx, vscale), vw);
+                        _mm256_storeu_ps(y + i00, vy);
+                    }
+                    for (; i00 < ne00; i00++) {
+                        y[i00] = x[i00] * scale * w[i00];
+                    }
+#else
                     for (int64_t i00 = 0; i00 < ne00; i00++) {
                         y[i00] = x[i00] * scale * w[i00];
                     }
+#endif
                 } else {
+#if defined(__AVX2__)
+                    const __m256 vscale = _mm256_set1_ps(scale);
+                    int64_t i00 = 0;
+                    for (; i00 + 7 < ne00; i00 += 8) {
+                        __m256 vx = _mm256_loadu_ps(x + i00);
+                        _mm256_storeu_ps(y + i00, _mm256_mul_ps(vx, vscale));
+                    }
+                    for (; i00 < ne00; i00++) {
+                        y[i00] = x[i00] * scale;
+                    }
+#else
                     memcpy(y, x, ne00 * sizeof(float));
                     ggml_vec_scale_f32(ne00, y, scale);
+#endif
                 }
             }
         }
