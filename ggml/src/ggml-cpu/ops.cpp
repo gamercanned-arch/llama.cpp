@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <type_traits>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -6338,6 +6339,46 @@ static void ggml_mrope_cache_init(
 
 template<typename T>
 static void rotate_pairs(const int64_t n, const int64_t n_offset, const float * cache, const T * src_data, T * dst_data, const int scale = 2) {
+#if defined(__AVX2__)
+  if (scale == 2 && std::is_same<T, float>::value) {
+    const float * const src_f = (const float *)src_data;
+    float * const dst_f       = (float *)dst_data;
+    int64_t i0 = 0;
+    for (; i0 + 15 < n; i0 += 16) {
+      const int64_t ic = i0 / 2;
+      __m256 vx0 = _mm256_loadu_ps(src_f + ic);
+      __m256 vx1 = _mm256_loadu_ps(src_f + ic + n_offset);
+
+      __m256 c0 = _mm256_loadu_ps(cache + i0 + 0);
+      __m256 c1 = _mm256_loadu_ps(cache + i0 + 8);
+
+      __m256 shuf_cos = _mm256_shuffle_ps(c0, c1, 0x88);
+      __m256 shuf_sin = _mm256_shuffle_ps(c0, c1, 0xDD);
+
+      __m256 vcos = _mm256_castsi256_ps(_mm256_permute4x64_epi64(_mm256_castps_si256(shuf_cos), 0xD8));
+      __m256 vsin = _mm256_castsi256_ps(_mm256_permute4x64_epi64(_mm256_castps_si256(shuf_sin), 0xD8));
+
+      __m256 vdst0 = _mm256_fmsub_ps(vx0, vcos, _mm256_mul_ps(vx1, vsin));
+      __m256 vdst1 = _mm256_fmadd_ps(vx0, vsin, _mm256_mul_ps(vx1, vcos));
+
+      _mm256_storeu_ps(dst_f + ic, vdst0);
+      _mm256_storeu_ps(dst_f + ic + n_offset, vdst1);
+    }
+    for (; i0 < n; i0 += 2) {
+      const int64_t ic = i0 / 2;
+      const float cos_theta = cache[i0 + 0];
+      const float sin_theta = cache[i0 + 1];
+
+      const float x0 = src_f[ic];
+      const float x1 = src_f[ic + n_offset];
+
+      dst_f[ic]            = x0*cos_theta - x1*sin_theta;
+      dst_f[ic + n_offset] = x0*sin_theta + x1*cos_theta;
+    }
+    return;
+  }
+#endif
+
   for (int64_t i0 = 0; i0 < n; i0 += 2) {
     const int64_t ic = i0/scale; // hack for GGML_ROPE_TYPE_NORMAL, where we need ic = i0; for all other cases, ic = i0/2
 
@@ -11337,6 +11378,124 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             // state is stored transposed: s_out[j*S_v + i] = S[i][j]
             // so row j of s_out = column j of S (contiguous access)
 
+#if defined(__AVX2__)
+            alignas(32) float exp_g_buf[256];
+            float * exp_g = (S_v <= 256) ? exp_g_buf : (float *)alloca(S_v * sizeof(float));
+            float decay_val = 1.0f;
+            __m256 v_decay = _mm256_set1_ps(1.0f);
+
+            if (kda) {
+                for (int64_t i = 0; i < S_v; ++i) {
+                    exp_g[i] = expf(g_d[i]);
+                }
+            } else {
+                decay_val = expf(g_d[0]);
+                v_decay = _mm256_set1_ps(decay_val);
+            }
+
+            for (int64_t j = 0; j < S_v; ++j) {
+                float * s_row = &s_out[j * S_v];
+
+                // Pass 1: State decay and dot product with k_d
+                __m256 acc_k0 = _mm256_setzero_ps();
+                __m256 acc_k1 = _mm256_setzero_ps();
+                int64_t i = 0;
+                for (; i + 15 < S_v; i += 16) {
+                    __m256 s0 = _mm256_loadu_ps(s_row + i + 0);
+                    __m256 s1 = _mm256_loadu_ps(s_row + i + 8);
+                    __m256 k0 = _mm256_loadu_ps(k_d + i + 0);
+                    __m256 k1 = _mm256_loadu_ps(k_d + i + 8);
+
+                    if (kda) {
+                        s0 = _mm256_mul_ps(s0, _mm256_loadu_ps(exp_g + i + 0));
+                        s1 = _mm256_mul_ps(s1, _mm256_loadu_ps(exp_g + i + 8));
+                    } else {
+                        s0 = _mm256_mul_ps(s0, v_decay);
+                        s1 = _mm256_mul_ps(s1, v_decay);
+                    }
+
+                    _mm256_storeu_ps(s_row + i + 0, s0);
+                    _mm256_storeu_ps(s_row + i + 8, s1);
+
+                    acc_k0 = _mm256_fmadd_ps(s0, k0, acc_k0);
+                    acc_k1 = _mm256_fmadd_ps(s1, k1, acc_k1);
+                }
+                for (; i + 7 < S_v; i += 8) {
+                    __m256 s0 = _mm256_loadu_ps(s_row + i);
+                    __m256 k0 = _mm256_loadu_ps(k_d + i);
+                    if (kda) {
+                        s0 = _mm256_mul_ps(s0, _mm256_loadu_ps(exp_g + i));
+                    } else {
+                        s0 = _mm256_mul_ps(s0, v_decay);
+                    }
+                    _mm256_storeu_ps(s_row + i, s0);
+                    acc_k0 = _mm256_fmadd_ps(s0, k0, acc_k0);
+                }
+                acc_k0 = _mm256_add_ps(acc_k0, acc_k1);
+                __m128 lo_k = _mm256_castps256_ps128(acc_k0);
+                __m128 hi_k = _mm256_extractf128_ps(acc_k0, 1);
+                __m128 sum4_k = _mm_add_ps(lo_k, hi_k);
+                sum4_k = _mm_hadd_ps(sum4_k, sum4_k);
+                sum4_k = _mm_hadd_ps(sum4_k, sum4_k);
+                float sum_k = _mm_cvtss_f32(sum4_k);
+
+                for (; i < S_v; ++i) {
+                    float s0 = s_row[i] * (kda ? exp_g[i] : decay_val);
+                    s_row[i] = s0;
+                    sum_k += s0 * k_d[i];
+                }
+
+                // Compute delta_j
+                const float delta_j = (v_d[j] - sum_k) * beta_val;
+                const __m256 v_delta_j = _mm256_set1_ps(delta_j);
+
+                // Pass 2: Rank-1 state update and dot product with q_d
+                __m256 acc_q0 = _mm256_setzero_ps();
+                __m256 acc_q1 = _mm256_setzero_ps();
+                i = 0;
+                for (; i + 15 < S_v; i += 16) {
+                    __m256 s0 = _mm256_loadu_ps(s_row + i + 0);
+                    __m256 s1 = _mm256_loadu_ps(s_row + i + 8);
+                    __m256 k0 = _mm256_loadu_ps(k_d + i + 0);
+                    __m256 k1 = _mm256_loadu_ps(k_d + i + 8);
+                    __m256 q0 = _mm256_loadu_ps(q_d + i + 0);
+                    __m256 q1 = _mm256_loadu_ps(q_d + i + 8);
+
+                    s0 = _mm256_fmadd_ps(v_delta_j, k0, s0);
+                    s1 = _mm256_fmadd_ps(v_delta_j, k1, s1);
+
+                    _mm256_storeu_ps(s_row + i + 0, s0);
+                    _mm256_storeu_ps(s_row + i + 8, s1);
+
+                    acc_q0 = _mm256_fmadd_ps(s0, q0, acc_q0);
+                    acc_q1 = _mm256_fmadd_ps(s1, q1, acc_q1);
+                }
+                for (; i + 7 < S_v; i += 8) {
+                    __m256 s0 = _mm256_loadu_ps(s_row + i);
+                    __m256 k0 = _mm256_loadu_ps(k_d + i);
+                    __m256 q0 = _mm256_loadu_ps(q_d + i);
+
+                    s0 = _mm256_fmadd_ps(v_delta_j, k0, s0);
+                    _mm256_storeu_ps(s_row + i, s0);
+                    acc_q0 = _mm256_fmadd_ps(s0, q0, acc_q0);
+                }
+                acc_q0 = _mm256_add_ps(acc_q0, acc_q1);
+                __m128 lo_q = _mm256_castps256_ps128(acc_q0);
+                __m128 hi_q = _mm256_extractf128_ps(acc_q0, 1);
+                __m128 sum4_q = _mm_add_ps(lo_q, hi_q);
+                sum4_q = _mm_hadd_ps(sum4_q, sum4_q);
+                sum4_q = _mm_hadd_ps(sum4_q, sum4_q);
+                float sum_q = _mm_cvtss_f32(sum4_q);
+
+                for (; i < S_v; ++i) {
+                    float s0 = s_row[i] + delta_j * k_d[i];
+                    s_row[i] = s0;
+                    sum_q += s0 * q_d[i];
+                }
+
+                attn_data[j] = sum_q * scale;
+            }
+#else
             if (kda) {
                 // precompute exp(g) into delta scratch (reused below)
                 for (int64_t i = 0; i < S_v; ++i) {
@@ -11368,6 +11527,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1);
                 attn_data[j] = sum * scale;
             }
+#endif
 
             attn_data += S_v * H; // advance to next token
 

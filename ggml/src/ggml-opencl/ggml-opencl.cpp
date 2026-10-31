@@ -475,6 +475,7 @@ struct ggml_backend_opencl_device_context {
     std::regex *opfilter = nullptr; // regex of ops to not claim
     std::string opfilter_str = ""; // regex string for opfilter
     size_t global_mem_size = 0;
+    bool has_linear_recurrent_ops = false;
 };
 
 // Lazily-compiled flash-attention kernels and their per-(dk,dv) tile metadata.
@@ -10823,8 +10824,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                    op->src[1]->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
                    (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
         case GGML_OP_SSM_CONV:
+            if (dev_ctx) {
+                dev_ctx->has_linear_recurrent_ops = true;
+            }
             return (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
         case GGML_OP_SSM_SCAN: {
+                if (dev_ctx) {
+                    dev_ctx->has_linear_recurrent_ops = true;
+                }
                 if (op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 ||
                     op->src[1]->type != GGML_TYPE_F32 || op->src[2]->type != GGML_TYPE_F32 ||
                     op->src[3]->type != GGML_TYPE_F32 || op->src[4]->type != GGML_TYPE_F32 ||
@@ -10837,6 +10844,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             }
         case GGML_OP_GATED_DELTA_NET:
             {
+                if (dev_ctx) {
+                    dev_ctx->has_linear_recurrent_ops = true;
+                }
                 // Match the Vulkan backend: only F32 -> F32, S_v in {16, 32, 64, 128}.
                 if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
                     return false;
@@ -15852,6 +15862,33 @@ static int64_t ggml_opencl_get_op_batch_size(const struct ggml_tensor * op) {
 }
 
 static bool ggml_backend_opencl_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    auto * dev_ctx = static_cast<ggml_backend_opencl_device_context *>(dev->context);
+
+    // Hybrid Offload Guard: Avoid graph fragmentation for models with linear-recurrent SSM / DeltaNet ops.
+    if (dev_ctx && dev_ctx->has_linear_recurrent_ops) {
+        return false;
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const struct ggml_tensor * src = op->src[i];
+        if (src && src->name[0] != '\0') {
+            if (strstr(src->name, "ssm_") || strstr(src->name, "attn_gate") || strstr(src->name, "attn_qkv")) {
+                if (dev_ctx) {
+                    dev_ctx->has_linear_recurrent_ops = true;
+                }
+                return false;
+            }
+        }
+    }
+    if (op->name[0] != '\0') {
+        if (strstr(op->name, "ssm") || strstr(op->name, "delta_net") || strstr(op->name, "conv_")) {
+            if (dev_ctx) {
+                dev_ctx->has_linear_recurrent_ops = true;
+            }
+            return false;
+        }
+    }
+
     static int min_batch = -1;
     if (min_batch == -1) {
         const char * env = getenv("GGML_OPENCL_OP_OFFLOAD_MIN_BATCH");
@@ -15859,7 +15896,6 @@ static bool ggml_backend_opencl_device_offload_op(ggml_backend_dev_t dev, const 
     }
     return (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) &&
            ggml_opencl_get_op_batch_size(op) >= min_batch;
-    GGML_UNUSED(dev);
 }
 
 static bool ggml_backend_opencl_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
